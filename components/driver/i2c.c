@@ -80,6 +80,7 @@ static const char *I2C_TAG = "i2c";
 #define I2C_CMD_ALIVE_INTERVAL_TICK    (1000 / portTICK_PERIOD_MS)
 #define I2C_CMD_EVT_ALIVE              (0)
 #define I2C_CMD_EVT_DONE               (1)
+#define I2C_CMD_EVT_NEXT               (2)
 #define I2C_EVT_QUEUE_LEN              (1)
 #if SOC_I2C_SUPPORT_SLAVE
     #define I2C_SLAVE_TIMEOUT_DEFAULT      (32000)     /* I2C slave timeout value, APB clock cycle number */
@@ -1385,71 +1386,9 @@ static void IRAM_ATTR i2c_master_cmd_begin_static(i2c_port_t i2c_num, portBASE_T
         p_i2c->status = I2C_STATUS_IDLE;
         return;
     }
-    const i2c_hw_cmd_t hw_end_cmd = {
-        .op_code = I2C_LL_CMD_END
-    };
-    while (p_i2c->cmd_link.head) {
-        i2c_cmd_t *cmd = &p_i2c->cmd_link.head->cmd;
-        const size_t remaining_bytes = cmd->total_bytes - cmd->bytes_used;
-
-        i2c_hw_cmd_t hw_cmd = cmd->hw_cmd;
-        uint8_t fifo_fill = 0;
-
-        if (cmd->hw_cmd.op_code == I2C_LL_CMD_WRITE) {
-            uint8_t *write_pr = NULL;
-
-            //TODO: to reduce interrupt number
-            if (!i2c_cmd_is_single_byte(cmd)) {
-                fifo_fill = MIN(remaining_bytes, SOC_I2C_FIFO_LEN);
-                /* cmd->data shall not be altered!
-                 * Else it would not be possible to reuse the commands list. */
-                write_pr = cmd->data + cmd->bytes_used;
-                cmd->bytes_used += fifo_fill;
-            } else {
-                fifo_fill = 1;
-                /* `data_byte` field contains the data itself.
-                 * NOTE: It is possible to get the correct data (and not 0s)
-                 * because both Xtensa and RISC-V architectures used on ESP
-                 * boards are little-endian.
-                 */
-                write_pr = (uint8_t*) &cmd->data_byte;
-            }
-            hw_cmd.byte_num = fifo_fill;
-            i2c_hal_write_txfifo(&(i2c_context[i2c_num].hal), write_pr, fifo_fill);
-            i2c_hal_write_cmd_reg(&(i2c_context[i2c_num].hal), hw_cmd, p_i2c->cmd_idx);
-            i2c_hal_write_cmd_reg(&(i2c_context[i2c_num].hal), hw_end_cmd, p_i2c->cmd_idx + 1);
-            i2c_hal_enable_master_tx_it(&(i2c_context[i2c_num].hal));
-            p_i2c->cmd_idx = 0;
-            if (i2c_cmd_is_single_byte(cmd) || cmd->total_bytes == cmd->bytes_used) {
-                p_i2c->cmd_link.head = p_i2c->cmd_link.head->next;
-                if(p_i2c->cmd_link.head) {
-                    p_i2c->cmd_link.head->cmd.bytes_used = 0;
-                }
-            }
-            p_i2c->status = I2C_STATUS_WRITE;
-            break;
-        } else if (cmd->hw_cmd.op_code == I2C_LL_CMD_READ) {
-            //TODO: to reduce interrupt number
-            fifo_fill = MIN(remaining_bytes, SOC_I2C_FIFO_LEN);
-            p_i2c->rx_cnt = fifo_fill;
-            hw_cmd.byte_num = fifo_fill;
-            i2c_hal_write_cmd_reg(&(i2c_context[i2c_num].hal), hw_cmd, p_i2c->cmd_idx);
-            i2c_hal_write_cmd_reg(&(i2c_context[i2c_num].hal), hw_end_cmd, p_i2c->cmd_idx + 1);
-            i2c_hal_enable_master_rx_it(&(i2c_context[i2c_num].hal));
-            p_i2c->status = I2C_STATUS_READ;
-            break;
-        } else {
-            i2c_hal_write_cmd_reg(&(i2c_context[i2c_num].hal), hw_cmd, p_i2c->cmd_idx);
-        }
-        p_i2c->cmd_idx++;
-        p_i2c->cmd_link.head = p_i2c->cmd_link.head->next;
-        if (p_i2c->cmd_link.head == NULL || p_i2c->cmd_idx >= 15) {
-            p_i2c->cmd_idx = 0;
-            break;
-        }
-    }
-    i2c_hal_update_config(&(i2c_context[i2c_num].hal));
-    i2c_hal_trans_start(&(i2c_context[i2c_num].hal));
+    // return I2C_CMD_EVT_NEXT status to handle the next opearation outside ISR
+    evt.type = I2C_CMD_EVT_NEXT;
+    xQueueOverwriteFromISR(p_i2c->cmd_evt_queue, &evt, HPTaskAwoken);
     return;
 }
 
@@ -1562,6 +1501,73 @@ esp_err_t i2c_master_cmd_begin(i2c_port_t i2c_num, i2c_cmd_handle_t cmd_handle, 
                     ret = ESP_OK;
                 }
                 break;
+            }
+            if (evt.type == I2C_CMD_EVT_NEXT) {
+                const i2c_hw_cmd_t hw_end_cmd = {
+                    .op_code = I2C_LL_CMD_END
+                };
+                while (p_i2c->cmd_link.head) {
+                    i2c_cmd_t *cmd = &p_i2c->cmd_link.head->cmd;
+                    const size_t remaining_bytes = cmd->total_bytes - cmd->bytes_used;
+
+                    i2c_hw_cmd_t hw_cmd = cmd->hw_cmd;
+                    uint8_t fifo_fill = 0;
+
+                    if (cmd->hw_cmd.op_code == I2C_LL_CMD_WRITE) {
+                        uint8_t *write_pr = NULL;
+
+                        //TODO: to reduce interrupt number
+                        if (!i2c_cmd_is_single_byte(cmd)) {
+                            fifo_fill = MIN(remaining_bytes, SOC_I2C_FIFO_LEN);
+                            /* cmd->data shall not be altered!
+                            * Else it would not be possible to reuse the commands list. */
+                            write_pr = cmd->data + cmd->bytes_used;
+                            cmd->bytes_used += fifo_fill;
+                        } else {
+                            fifo_fill = 1;
+                            /* `data_byte` field contains the data itself.
+                            * NOTE: It is possible to get the correct data (and not 0s)
+                            * because both Xtensa and RISC-V architectures used on ESP
+                            * boards are little-endian.
+                            */
+                            write_pr = (uint8_t*) &cmd->data_byte;
+                        }
+                        hw_cmd.byte_num = fifo_fill;
+                        i2c_hal_write_txfifo(&(i2c_context[i2c_num].hal), write_pr, fifo_fill);
+                        i2c_hal_write_cmd_reg(&(i2c_context[i2c_num].hal), hw_cmd, p_i2c->cmd_idx);
+                        i2c_hal_write_cmd_reg(&(i2c_context[i2c_num].hal), hw_end_cmd, p_i2c->cmd_idx + 1);
+                        i2c_hal_enable_master_tx_it(&(i2c_context[i2c_num].hal));
+                        p_i2c->cmd_idx = 0;
+                        if (i2c_cmd_is_single_byte(cmd) || cmd->total_bytes == cmd->bytes_used) {
+                            p_i2c->cmd_link.head = p_i2c->cmd_link.head->next;
+                            if(p_i2c->cmd_link.head) {
+                                p_i2c->cmd_link.head->cmd.bytes_used = 0;
+                            }
+                        }
+                        p_i2c->status = I2C_STATUS_WRITE;
+                        break;
+                    } else if (cmd->hw_cmd.op_code == I2C_LL_CMD_READ) {
+                        //TODO: to reduce interrupt number
+                        fifo_fill = MIN(remaining_bytes, SOC_I2C_FIFO_LEN);
+                        p_i2c->rx_cnt = fifo_fill;
+                        hw_cmd.byte_num = fifo_fill;
+                        i2c_hal_write_cmd_reg(&(i2c_context[i2c_num].hal), hw_cmd, p_i2c->cmd_idx);
+                        i2c_hal_write_cmd_reg(&(i2c_context[i2c_num].hal), hw_end_cmd, p_i2c->cmd_idx + 1);
+                        i2c_hal_enable_master_rx_it(&(i2c_context[i2c_num].hal));
+                        p_i2c->status = I2C_STATUS_READ;
+                        break;
+                    } else {
+                        i2c_hal_write_cmd_reg(&(i2c_context[i2c_num].hal), hw_cmd, p_i2c->cmd_idx);
+                    }
+                    p_i2c->cmd_idx++;
+                    p_i2c->cmd_link.head = p_i2c->cmd_link.head->next;
+                    if (p_i2c->cmd_link.head == NULL || p_i2c->cmd_idx >= 15) {
+                        p_i2c->cmd_idx = 0;
+                        break;
+                    }
+                }
+                i2c_hal_update_config(&(i2c_context[i2c_num].hal));
+                i2c_hal_trans_start(&(i2c_context[i2c_num].hal));
             }
             if (evt.type == I2C_CMD_EVT_ALIVE) {
             }
